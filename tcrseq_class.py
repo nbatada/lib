@@ -3,6 +3,9 @@ import pandas as pd, numpy as np
 import matplotlib.pyplot as plt
 import plotnine as p9
 from scipy.stats import entropy
+from upsetplot import from_indicators
+# use our unit function from mizani (or fallback defined earlier)
+
 try:
     from matplotlib_venn import venn2, venn3
 except ImportError:
@@ -14,13 +17,30 @@ try:
 except ImportError:
     cp = None
 
+def unit(value, unit_type):
+    # Fallback: simply return a string that ggplot2 might interpret.
+    return f"{value} {unit_type}"
 
-try:
-    from mizani.unit import unit
-except ImportError:
-    def unit(value, unit_type):
-        # Fallback: simply return a string that ggplot2 might interpret.
-        return f"{value} {unit_type}"
+
+# ----------------------
+# A “professional” ggplot theme (mimicking a scienceplots–like style)
+# ----------------------
+
+def professional_theme():
+    return (p9.theme(
+        panel_background=p9.element_rect(fill="white", color=None),
+        panel_grid_major=p9.element_line(linetype="dotted", color="grey", size=0.5),
+        panel_grid_minor=p9.element_line(linetype="dotted", color="grey", size=0.2),
+        panel_border=p9.element_rect(color="grey", fill=None),
+        legend_title=p9.element_text(face="bold", size=8),
+        legend_text=p9.element_text(size=7),
+        legend_direction="horizontal",
+        legend_position="top",
+        axis_title=p9.element_text(size=9, weight="bold"),
+        axis_text_x=p9.element_text(rotation=25, hjust=1, size=8),
+        axis_text_y=p9.element_text(size=8),
+        strip_text=p9.element_text(size=8)
+    ))
 
 
 # ----------------------
@@ -73,19 +93,17 @@ class TCRSeq:
         """Counts matrix (clones x samples)."""
         return self.tl.get_counts_matrix()
 
-    # --- New Utility Methods ---
-
     def get_stats(self) -> pd.DataFrame:
         """
         Get per-sample reading statistics.
-        Also update the self.obs metadata by joining in these stats.
+        Returns a DataFrame that merges the sample metadata (.obs) with
+        the statistics computed via tl.get_sample_stats(), without modifying self.obs.
         """
         stats_df = self.tl.get_sample_stats()
         if not self.obs.empty:
-            # Join stats on index (sample_id)
-            stats_df = stats_df.set_index('sample_id')
-            self.obs = self.obs.join(stats_df, how="left")
-            stats_df = self.obs.reset_index()
+            # Join on sample_id without updating self.obs
+            joined = self.obs.join(stats_df.set_index('sample_id'), how="left").reset_index()
+            return joined
         return stats_df
 
     def get_top_clones(self, sample_ids: list, n: int = 10) -> pd.DataFrame:
@@ -211,7 +229,7 @@ class TCRSeq:
         for i, row in sample_info.iterrows():
             sample_id = row[sample_id_col]
             filename = row[filename_col]
-            print(f"Loading sample {sample_id} from file {filename} ...", file=sys.stderr)
+            # print(f"Loading sample {sample_id} from file {filename} ...", file=sys.stderr)
             tcr_sample = cls.from_file(filename, **kwargs)
             # Override sample_id using sample_info.
             tcr_sample.df['sample_id'] = sample_id
@@ -225,7 +243,7 @@ class TCRSeq:
         print(f"Loaded {len(dfs)} samples with a total of {combined_df.shape[0]} rows.", file=sys.stderr)
         stats_df = pd.DataFrame(stats_list)
         # For multiple samples, data_name is set to "all".
-        return cls(combined_df, obs, data_name="all"), stats_df
+        return cls(combined_df, obs, data_name="all")
 
     def _get_reading_stats(self) -> dict:
         n_total = self.df.shape[0]
@@ -233,9 +251,10 @@ class TCRSeq:
         n_clones_all = self.df['chain_clonotype_id'].nunique()
         n_clones_prod = self.df[self.df['productive'] == True]['chain_clonotype_id'].nunique() if 'productive' in self.df.columns else n_clones_all
         
-        n_TRA = self.df[self.df['TRA_custom_id'] != '']['TRA_custom_id'].nunique() if 'TRA_custom_id' in self.df.columns else 0
-        n_TRB = self.df[self.df['TRB_custom_id'] != '']['TRB_custom_id'].nunique() if 'TRB_custom_id' in self.df.columns else 0
-        pct_TRB=float(n_TRB/n_clones_prod)
+        n_TRA = self.df[self.df['TRA_custom_id'] != ''][ 'TRA_custom_id'].nunique() if 'TRA_custom_id' in self.df.columns else 0
+        n_TRB = self.df[self.df['TRB_custom_id'] != ''][ 'TRB_custom_id'].nunique() if 'TRB_custom_id' in self.df.columns else 0
+        pct_TRB = float(n_TRB/n_clones_prod)
+        pct_TRA = float(n_TRA/n_clones_prod)
         sample_id = self.df['sample_id'].unique()[0]
         shannon_diversity = self.tl.compute_entropy().get(sample_id, np.nan)
         gini_unevenness = self.tl.compute_gini().get(sample_id, np.nan)
@@ -246,13 +265,9 @@ class TCRSeq:
             pct_clones_gt1 = np.nan
         return {
             'sample_id': sample_id,
-            #'n_total': n_total,
-            #'n_prod': n_prod,
+            'pct_TRA': pct_TRA,
             'pct_TRB': pct_TRB,
-            'n_clones_all': n_total, #n_clones_all,
-            #'n_clones_prod': n_prod, #n_clones_prod,
-            'n_TRA': n_TRA,
-            'n_TRB': n_TRB,
+            'n_clones_all': n_total,  # replaced later by detailed TRA/TRB stacked bar
             'shannon_diversity': shannon_diversity,
             'gini_unevenness': gini_unevenness,
             'pct_clones_gt1': pct_clones_gt1,
@@ -361,183 +376,167 @@ class _TCRSeqTools:
 # ----------------------------
 # Plotting Namespace (pl)
 # ----------------------------
-def professional_theme():
-    return p9.theme(
-        panel_background=p9.element_rect(fill="white"),
-        panel_grid_major=p9.element_line(linetype='dotted', color='grey', size=0.2),
-        panel_grid_minor=p9.element_line(linetype='dotted', color='grey', size=0.5),
-        panel_border=p9.element_rect(color='grey', fill=None),
-        legend_title=p9.element_text(weight="bold"),
-        legend_direction="horizontal",
-        legend_text=p9.element_text(size=8),
-        axis_text_x=p9.element_text(rotation=45, hjust=1, size=6),
-        axis_text_y=p9.element_text(size=8),
-        legend_position='top',
-        strip_text=p9.element_text(size=6)
-    )
-
 
 class _TCRSeqPlotting:
-    def __init__(self, adata: TCRSeq):
+    def __init__(self, adata):
         self.adata = adata
-
-    def plot_sample_stats(self, split_by: str = None, ncol: int = None, nrow: int = None, FILL: str = 'sample_id'):
+    def plot_sequence_stats(self, prefix: str = 'seqstats_', FILL: str = 'sample_id', 
+                              x_min: float = None, y_min: float = None):
         """
-        Bar plots for per-sample reading statistics.
-        Each metric (column) in the stats is shown in its own facet.
-        If split_by is provided (the name of a column in obs), it is added to the facet formula.
-        ncol and nrow allow you to specify the facet layout.
-        FILL is the column name used for the bar fill color.
+        Creates scatter plots using sequence statistics from the sample metadata (.obs).
+        Two plots are produced:
+          1) A scatter plot with x-axis = prefix + "reads" and y-axis = prefix + "umi"
+          2) A scatter plot with x-axis = prefix + "umi" and y-axis = n_clones_all
+        A best-fit (linear) line is overlaid and the Spearman rho and p-value are added to the title.
+        x_min and y_min (if provided) are respected on the log10-transformed axes.
         """
-        stats_df = self.adata.tl.get_sample_stats()
-        # If split_by is provided and exists in obs, merge that column into stats_df.
-        if split_by is not None and self.adata.obs is not None and split_by in self.adata.obs.columns:
-            obs_reset = self.adata.obs.reset_index()
-            stats_df = stats_df.merge(obs_reset[['sample_id', split_by]], on='sample_id', how='left')
-            id_vars = ["sample_id", split_by]
-            facet_formula = "~ metric + " + split_by
-        else:
-            id_vars = ["sample_id"]
-            facet_formula = "~ metric"
-
-        # If you want the fill column from obs, merge that column if missing.
-        if FILL != "sample_id" and (split_by is None or FILL not in stats_df.columns):
-            if self.adata.obs is not None and FILL in self.adata.obs.columns:
-                obs_reset = self.adata.obs.reset_index()
-                stats_df = stats_df.merge(obs_reset[['sample_id', FILL]], on='sample_id', how='left')
-                if FILL not in id_vars:
-                    id_vars.append(FILL)
-
-        # Convert the fill column to a categorical variable for a discrete color scale.
-        if FILL in stats_df.columns:
-            stats_df[FILL] = stats_df[FILL].astype('category')
-
-        stats_melt = stats_df.melt(id_vars=id_vars, var_name="metric", value_name="value")
-
-        # Ensure that the fill aesthetic is set to a column that exists.
-        fill_mapping = FILL if FILL in stats_melt.columns else "sample_id"
-
-        # If data for only TRB exist, force the n_TRA facet to have the same y scale as n_TRB.
-        if 'n_TRA' in stats_melt['metric'].unique() and 'n_TRB' in stats_melt['metric'].unique():
-            max_trb = stats_melt.loc[stats_melt['metric'] == 'n_TRB', 'value'].max()
-            max_tra = stats_melt.loc[stats_melt['metric'] == 'n_TRA', 'value'].max()
-            if max_trb > max_tra:
-                # Append a dummy row to "n_TRA" so that its y-scale reaches max_trb.
-                dummy = pd.DataFrame({
-                    'sample_id': [stats_melt['sample_id'].iloc[0]],
-                    'metric': ['n_TRA'],
-                    'value': [max_trb],
-                })
-                if split_by is not None:
-                    dummy[split_by] = stats_melt[split_by].iloc[0]
-                if FILL in stats_melt.columns:
-                    dummy[FILL] = stats_melt[FILL].iloc[0]
-                stats_melt = pd.concat([stats_melt, dummy], ignore_index=True)
-
-        base_plot = (
-            p9.ggplot(stats_melt, p9.aes(x="sample_id", y="value", fill=fill_mapping))
-            + p9.geom_bar(stat="identity")
-            + p9.labs(
-                title=f"[{self.adata.data_name}] Per-Sample Reading Stats",
-                x="Sample ID",
-                y="Value"
-            )
-            + p9.theme(
-                axis_text_x=p9.element_text(rotation=90, hjust=1, size=4),
-                panel_spacing=0.5, figure_size=(26, 3)
-            )
-            + p9.facet_wrap(facet_formula, scales="free_y", ncol=ncol, nrow=nrow)
-            + professional_theme()
-        )
-        return base_plot
-
-
-    def plot_upset(self):
-        cm = self.adata.tl.get_counts_matrix()
-        pres = cm > 0
-        upset_data = from_indicators(pres.columns.tolist(), pres)
-        fig = upset_plot(upset_data)
-        plt.title(f"[{self.adata.data_name}] Upset Plot")
-        plt.tight_layout()
-        plt.show()
-        return fig
-
-    def plot_venn(self, group: str = None):
-        if venn2 is None:
-            raise ImportError("matplotlib-venn required")
-        if group and self.adata.obs is not None and 'group' in self.adata.obs.columns:
-            samples = self.adata.obs[self.adata.obs['group'] == group].index.tolist()
-        else:
-            samples = self.adata.samples
-        if len(samples) == 2:
-            sets = [set(self.adata.df[self.adata.df['sample_id'] == s]['combined_custom_id'])
-                    for s in samples]
-            plt.figure(); venn2(sets, set_labels=samples)
-            plt.title(f"[{self.adata.data_name}] Venn Diagram")
-            plt.show()
-        elif len(samples) == 3:
-            sets = [set(self.adata.df[self.adata.df['sample_id'] == s]['combined_custom_id'])
-                    for s in samples]
-            plt.figure(); venn3(sets, set_labels=samples)
-            plt.title(f"[{self.adata.data_name}] Venn Diagram")
-            plt.show()
-        else:
-            print("Venn supports only 2 or 3 sets.")
-
-    def plot_pie_common_clones(self, top_n: int = 5):
-        # Use matplotlib to create a pie chart.
-        cm = self.adata.tl.get_counts_matrix().sum(axis=1)
-        top = cm.sort_values(ascending=False).head(top_n)
-        others = cm.sum() - top.sum()
-        # Pandas append vs concat compatibility:
-        data = top.append(pd.Series({'Others': others})) if hasattr(top, 'append') else pd.concat([top, pd.Series({'Others': others})])
-        fig, ax = plt.subplots()
-        ax.pie(data.values, labels=data.index, autopct='%1.1f%%', startangle=90)
-        ax.axis('equal')
-        ax.set_title(f"[{self.adata.data_name}] Top {top_n} Clones")
-        plt.show()
-        return fig
-
-    def plot_shared_clones_dot(self, split_by: str = None, n_top: int = 10):
-        """
-        Scanpy-style dot plot.
-        y-axis: combined_custom_id
-        x-axis: sample_id
-        dot size: clone count
-        Only plot the top n_top clones (by average count across all samples).
-        Optionally facet by split_by if provided.
-        """
-        if 'consensus_count' in self.adata.df.columns:
-            agg = self.adata.df.groupby(['sample_id', 'combined_custom_id']).agg(
-                clone_count=('consensus_count', 'sum')
-            ).reset_index()
-        else:
-            agg = self.adata.df.groupby(['sample_id', 'combined_custom_id']).size().reset_index(name='clone_count')
-        # Compute the average clone count (across samples) for each clone.
-        avg_df = agg.groupby('combined_custom_id')['clone_count'].mean().reset_index()
-        top_clones = avg_df.sort_values(by='clone_count', ascending=False).head(n_top)['combined_custom_id']
-        agg = agg[agg['combined_custom_id'].isin(top_clones)]
-        facet = None
-        if split_by is not None and self.adata.obs is not None and split_by in self.adata.obs.columns:
-            obs_reset = self.adata.obs.reset_index()
-            agg = agg.merge(obs_reset[['sample_id', split_by]], on='sample_id', how='left')
-            facet = f"~ {split_by}"
+        # Ensure we have the stats; if overlapping columns exist, drop them from self.adata.obs without modifying it permanently.
+        try:
+            df = self.adata.get_stats()
+        except ValueError as e:
+            if "columns overlap" in str(e):
+                stats_df = self.adata.tl.get_sample_stats().set_index('sample_id')
+                overlap = self.adata.obs.columns.intersection(stats_df.columns)
+                if len(overlap) > 0:
+                    self.adata.obs = self.adata.obs.drop(columns=list(overlap))
+                df = self.adata.get_stats()
+            else:
+                raise e
         
-        p = (p9.ggplot(agg, p9.aes(x='sample_id', y='combined_custom_id', size='clone_count'))
-             + p9.geom_point()
-             + p9.labs(title=f"[{self.adata.data_name}] Dot Plot (Top {n_top} Clones)", 
-                       x="Sample", y="Clone", size="Clone Count")
-             + professional_theme()
-        )
-        if facet:
-            p = p + p9.facet_wrap(facet, scales="free_y")
-        return p
+        # Define expected column names
+        reads_col = prefix + "reads"
+        umi_col = prefix + "umi"
+        if reads_col not in df.columns or umi_col not in df.columns:
+            raise ValueError(f"Required columns {reads_col} and/or {umi_col} not found in sample metadata (.obs)")
+        if "n_clones_all" not in df.columns:
+            raise ValueError("Column n_clones_all not found in sample metadata (.obs)")
+        
+        # Convert columns to numeric and drop rows with missing values
+        for col in [reads_col, umi_col, "n_clones_all"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=[reads_col, umi_col, "n_clones_all"])
+        
+        # Set up aesthetic mappings; include FILL as color if provided
+        mapping1 = p9.aes(x=reads_col, y=umi_col)
+        mapping2 = p9.aes(x=umi_col, y="n_clones_all")
+        if FILL in df.columns and FILL != "sample_id":
+            mapping1 = p9.aes(x=reads_col, y=umi_col, color=FILL)
+            mapping2 = p9.aes(x=umi_col, y="n_clones_all", color=FILL)
+        
+        # Calculate Spearman correlation for the first scatter plot:
+        from scipy.stats import spearmanr
+        rho1, pval1 = spearmanr(df[reads_col], df[umi_col])
+        title1 = (f"[{self.adata.data_name}] {reads_col.removeprefix(prefix)} vs {umi_col.removeprefix(prefix)} "
+                  f"(ρ={rho1:.2f}, p={pval1:.3g})")
+        
+        # Plot 1: reads vs umi with best-fit line
+        p1 = (p9.ggplot(df, mapping1) +
+              p9.geom_point() +
+              p9.geom_smooth(method="lm", se=False, color="black") +
+              p9.labs(x=reads_col.removeprefix(prefix),
+                      y=umi_col.removeprefix(prefix),
+                      title=title1) +
+              professional_theme() +
+              p9.theme(panel_spacing=0.4))
+        # Apply log10 scales with optional limits if provided.
+        if x_min is not None:
+            p1 = p1 + p9.scale_x_log10(limits=(x_min, None))
+        else:
+            p1 = p1 + p9.scale_x_log10()
+        if y_min is not None:
+            p1 = p1 + p9.scale_y_log10(limits=(y_min, None))
+        else:
+            p1 = p1 + p9.scale_y_log10()
+        
+        # Calculate Spearman correlation for scatter plot 2:
+        rho2, pval2 = spearmanr(df[umi_col], df["n_clones_all"])
+        title2 = (f"[{self.adata.data_name}] {umi_col.removeprefix(prefix)} vs n_clones_all "
+                  f"(ρ={rho2:.2f}, p={pval2:.3g})")
+        
+        # Plot 2: umi vs n_clones_all with best-fit line
+        p2 = (p9.ggplot(df, mapping2) +
+              p9.geom_point() +
+              p9.geom_smooth(method="lm", se=False, color="black") +
+              p9.labs(x=umi_col.removeprefix(prefix),
+                      y="n_clones_all",
+                      title=title2) +
+              professional_theme() +
+              p9.theme(panel_spacing=0.4))
+        if x_min is not None:
+            p2 = p2 + p9.scale_x_log10(limits=(x_min, None))
+        else:
+            p2 = p2 + p9.scale_x_log10()
+        if y_min is not None:
+            p2 = p2 + p9.scale_y_log10(limits=(y_min, None))
+        else:
+            p2 = p2 + p9.scale_y_log10()
+        
+        # Combine the two plots vertically using cowpatch if available.
+        try:
+            import cowpatch as cow
+            import numpy as np
+            vis_patch = cow.patch(p1, p2)
+            vis_patch += cow.layout(design=np.array([0, 1]))  # Stack vertically
+            final_plot = vis_patch
+        except ImportError:
+            final_plot = (p1, p2)
+        print(final_plot.show())
 
-    def plot_clone_bar_by_sample(self, split_by: str = None):
+    def plot_sample_stats(self, split_by: str = None, FILL: str = 'sample_id',
+                          x_min: float = None, y_min: float = None, label_order: list = None):
         """
-        Bar plot of unique TRA and TRB clone counts per sample.
-        If split_by is provided, facet the plot accordingly.
+        Composite plot made entirely with plotnine:
+          • A faceted bar plot of per‐sample metrics (excluding n_clones_all)
+          • A stacked bar plot of unique TRA and TRB clone counts per sample.
+        Extra spacing between panels is added.
+        x_min and y_min allow you to set the lower limits for the x and y axes.
+        label_order is a list of sample_id values specifying the order of x-axis labels.
         """
+        # Get per-sample stats
+        stats_df = self.adata.tl.get_sample_stats()
+        
+        # Merge extra columns from self.adata.obs, if requested
+        if split_by is not None and self.adata.obs is not None and split_by in self.adata.obs.columns:
+            obs_reset = self.adata.obs.reset_index()
+            if split_by not in stats_df.columns:
+                stats_df = stats_df.merge(obs_reset[['sample_id', split_by]], on='sample_id', how='left')
+        if FILL != "sample_id" and self.adata.obs is not None and FILL in self.adata.obs.columns:
+            if FILL not in stats_df.columns:
+                stats_df = stats_df.merge(self.adata.obs.reset_index()[['sample_id', FILL]], on='sample_id', how='left')
+        
+        # Remove the n_clones_all metric so the detailed stacked bar plot can be added separately.
+        stats_for_melt = stats_df.drop(columns=['n_clones_all'], errors='ignore')
+        id_vars = ['sample_id']
+        if split_by is not None and split_by in stats_for_melt.columns:
+            id_vars.append(split_by)
+        if FILL != "sample_id" and FILL in stats_for_melt.columns:
+            id_vars.append(FILL)
+        value_vars = [col for col in stats_for_melt.columns if col not in id_vars]
+        metrics_long = stats_for_melt.melt(id_vars=id_vars, value_vars=value_vars,
+                                           var_name="metric", value_name="value")
+        mapping = p9.aes(x='sample_id', y='value')
+        if FILL in metrics_long.columns and FILL != "sample_id":
+            mapping = p9.aes(x='sample_id', y='value', fill=FILL)
+        p1 = (p9.ggplot(metrics_long, mapping) +
+              p9.geom_col() +
+              # Overlay the sample_id as text on each bar (dot)
+              p9.geom_text(mapping=p9.aes(label='sample_id'),
+                           position=p9.position_dodge(width=0.9),
+                           va='bottom', size=8) +
+              p9.facet_wrap('~metric', scales='free_y') +
+              p9.labs(x='Sample', y='Value', title=f"[{self.adata.data_name}] Per‐Sample Metrics") +
+              professional_theme() +
+              p9.theme(panel_spacing=0.4))
+        # Set x and y axis lower limits if specified.
+        if x_min is not None or y_min is not None:
+            p1 = p1 + p9.coord_cartesian(
+                xlim=(x_min, None) if x_min is not None else None,
+                ylim=(y_min, None) if y_min is not None else None)
+        # Apply x-axis ordering if a label_order is provided.
+        if label_order is not None:
+            p1 = p1 + p9.scale_x_discrete(limits=label_order)
+        
+        # Compute the stacked bar plot for TRA and TRB clone counts.
         df = self.adata.df.copy()
         tra = df[df['TRA_custom_id'] != ''][['sample_id', 'TRA_custom_id']].drop_duplicates()
         trb = df[df['TRB_custom_id'] != ''][['sample_id', 'TRB_custom_id']].drop_duplicates()
@@ -548,31 +547,155 @@ class _TCRSeqPlotting:
         trb_counts['chain'] = 'TRB'
         trb_counts.rename(columns={'TRB_custom_id': 'clone_count'}, inplace=True)
         counts = pd.concat([tra_counts, trb_counts], ignore_index=True)
-        if self.adata.obs is not None:
-            counts = counts.merge(self.adata.obs.reset_index(), on='sample_id', how='left')
-        base_plot = (p9.ggplot(counts, p9.aes(x='sample_id', y='clone_count', fill='chain'))
-                     + p9.geom_bar(stat='identity', position='dodge')
-                     + p9.labs(title=f"[{self.adata.data_name}] Unique Clone Counts per Sample",
-                               x="Sample", y="Clone Count")
-                     + professional_theme()
-                     + p9.theme(axis_text_x=p9.element_text(rotation=90, hjust=1))
-                    )
+        p2 = (p9.ggplot(counts, p9.aes(x='sample_id', y='clone_count', fill='chain')) +
+              p9.geom_col() +
+              p9.labs(x='Sample', y='Clone Count', title=f"[{self.adata.data_name}] Unique Clone Counts per Sample") +
+              professional_theme() +
+              p9.theme(panel_spacing=0.4))
+        if x_min is not None or y_min is not None:
+            p2 = p2 + p9.coord_cartesian(
+                xlim=(x_min, None) if x_min is not None else None,
+                ylim=(y_min, None) if y_min is not None else None)
+        if label_order is not None:
+            p2 = p2 + p9.scale_x_discrete(limits=label_order)
+        
+        # try:
+        #     import cowpatch as cow
+        #     import numpy as np
+        #     vis_patch = cow.patch(p1, p2)
+        #     vis_patch += cow.layout(design=np.array([[0], [1]]))  # Stack vertically
+        #     final_plot = vis_patch
+        # except ImportError:
+        #     final_plot = (p1, p2)
+        # return final_plot
+        return(p2)
+    
+
+    def plot_upset(self):
+        """
+        Creates an upset-style plot as a simple bar plot.
+        It converts the upsetplot output into a DataFrame and then builds a bar chart.
+        """
+        cm = self.adata.tl.get_counts_matrix()
+        pres = (cm > 0)
+        upset_series = from_indicators(pres.columns.tolist(), pres)
+        df_upset = upset_series.reset_index()
+        # Try to name the columns: columns for each set plus a final "count" column
+        col_names = list(pres.columns) + ['count']
+        if len(df_upset.columns) == len(col_names):
+            df_upset.columns = col_names
+        else:
+            df_upset.rename(columns={df_upset.columns[-1]: 'count'}, inplace=True)
+        # Create a new column "pattern" by concatenating set names where membership is True
+        def make_pattern(row):
+            return ",".join([str(c) for c in pres.columns if row[c]])
+        df_upset['pattern'] = df_upset.apply(make_pattern, axis=1)
+        df_upset = df_upset.sort_values(by='count', ascending=False)
+        p = (p9.ggplot(df_upset, p9.aes(x='pattern', y='count')) +
+             p9.geom_col() +
+             p9.labs(x="Set Intersection", y="Count", title=f"[{self.adata.data_name}] Upset Plot") +
+             p9.theme(axis_text_x=p9.element_text(rotation=45, ha="right")) +
+             professional_theme() +
+             p9.theme(panel_spacing=0.4))
+        return p
+
+    def plot_venn(self, group: str = None):
+        """
+        For 2 or 3 sets, calculates basic intersection counts and plots a bar chart 
+        that mimics a Venn diagram.
+        """
+        if group and self.adata.obs is not None and 'group' in self.adata.obs.columns:
+            samples = self.adata.obs[self.adata.obs['group'] == group].index.tolist()
+        else:
+            samples = self.adata.samples
+        if len(samples) == 2:
+            s1, s2 = samples[0], samples[1]
+            set1 = set(self.adata.df[self.adata.df['sample_id'] == s1]['combined_custom_id'])
+            set2 = set(self.adata.df[self.adata.df['sample_id'] == s2]['combined_custom_id'])
+            a_only = len(set1 - set2)
+            b_only = len(set2 - set1)
+            both = len(set1.intersection(set2))
+            df_venn = pd.DataFrame({
+                'Category': [f"Only {s1}", f"Only {s2}", "Intersection"],
+                'Count': [a_only, b_only, both]
+            })
+            p = (p9.ggplot(df_venn, p9.aes(x='Category', y='Count', fill='Category')) +
+                 p9.geom_col() +
+                 p9.labs(title=f"[{self.adata.data_name}] Venn Diagram ({s1} vs {s2})", x="Category", y="Clone Count") +
+                 professional_theme() +
+                 p9.theme(panel_spacing=0.4))
+            return p
+        elif len(samples) == 3:
+            s1, s2, s3 = samples[0], samples[1], samples[2]
+            set1 = set(self.adata.df[self.adata.df['sample_id'] == s1]['combined_custom_id'])
+            set2 = set(self.adata.df[self.adata.df['sample_id'] == s2]['combined_custom_id'])
+            set3 = set(self.adata.df[self.adata.df['sample_id'] == s3]['combined_custom_id'])
+            only1 = len(set1 - set2 - set3)
+            only2 = len(set2 - set1 - set3)
+            only3 = len(set3 - set1 - set2)
+            inter12 = len((set1.intersection(set2)) - set3)
+            inter13 = len((set1.intersection(set3)) - set2)
+            inter23 = len((set2.intersection(set3)) - set1)
+            inter123 = len(set1.intersection(set2).intersection(set3))
+            df_venn = pd.DataFrame({
+                'Category': [f"Only {s1}", f"Only {s2}", f"Only {s3}",
+                             f"{s1}&{s2} only", f"{s1}&{s3} only", f"{s2}&{s3} only",
+                             "All 3"],
+                'Count': [only1, only2, only3, inter12, inter13, inter23, inter123]
+            })
+            p = (p9.ggplot(df_venn, p9.aes(x='Category', y='Count', fill='Category')) +
+                 p9.geom_col() +
+                 p9.labs(title=f"[{self.adata.data_name}] Venn Diagram ({s1}, {s2}, {s3})", x="Category", y="Clone Count") +
+                 professional_theme() +
+                 p9.theme(panel_spacing=0.4, axis_text_x=p9.element_text(rotation=45, ha="right")))
+            return p
+        else:
+            # More than 3 sets – display a message in a plot.
+            df_msg = pd.DataFrame({'Message': [f"Venn diagram supports only 2 or 3 sets. Provided {len(samples)} sets."]})
+            p = (p9.ggplot(df_msg, p9.aes(x='Message', y='Message')) +
+                 p9.geom_text(p9.aes(label='Message'), size=10) +
+                 p9.labs(title="Venn Diagram") +
+                 professional_theme())
+            return p
+
+    def plot_shared_clone(self, split_by: str = None, n_top: int = 10):
+        """
+        Creates a dot plot for shared clones across samples.
+        It computes the average clone count for each clone (using the counts matrix),
+        ranks them, and plots only the top n clones.
+        X-axis: sample_id, Y-axis: clone (combined_custom_id),
+        Dot size reflects the clone count and color is set according to the provided split_by.
+        """
+        # Retrieve the counts matrix: rows are clones, columns are samples.
+        X = self.adata.X
+        # Compute the average clone count across all samples for each clone.
+        ave = X.mean(axis=1)
+        top_clones = ave.sort_values(ascending=False).head(n_top).index.tolist()
+        # Reshape the counts matrix for the top clones into long format.
+        X_top = X.loc[top_clones].reset_index().melt(id_vars='combined_custom_id', 
+                                                     var_name='sample_id', 
+                                                     value_name='clone_count')
+        # Optionally merge sample metadata if a grouping variable is provided.
         if split_by is not None and self.adata.obs is not None and split_by in self.adata.obs.columns:
-            base_plot = base_plot + p9.facet_wrap(f"~ {split_by}")
-            if cp is not None:
-                plots = []
-                for grp, sub_df in counts.groupby(split_by):
-                    pg = (p9.ggplot(sub_df, p9.aes(x='sample_id', y='clone_count', fill='chain'))
-                          + p9.geom_bar(stat='identity', position='dodge')
-                          + p9.labs(title=f"{split_by}: {grp}", x="Sample", y="Clone Count")
-                          + professional_theme()
-                          + p9.theme(axis_text_x=p9.element_text(rotation=90, hjust=1))
-                         )
-                    plots.append(pg)
-                base_plot = cp.ggplot_grid(plots, ncol=2)
-        return base_plot
+            obs_reset = self.adata.obs.reset_index()
+            X_top = X_top.merge(obs_reset[['sample_id', split_by]], on='sample_id', how='left')
+            colorField = split_by
+        else:
+            colorField = 'sample_id'
+        p = (p9.ggplot(X_top, p9.aes(x='sample_id', y='combined_custom_id',
+                                     size='clone_count', color=colorField)) +
+             p9.geom_point() +
+             p9.labs(x="Sample", y="Clone", size="Clone Count", color=colorField,
+                     title=f"[{self.adata.data_name}] Top {n_top} Shared Clones") +
+             professional_theme() +
+             p9.theme(panel_spacing=0.4, axis_text_x=p9.element_text(rotation=45, ha="right")))
+        return p
 
     def plot_saturation_curve(self, randomize: bool = False, n_iter: int = 100):
+        """
+        Plots a saturation curve (number of unique clones vs cumulative samples).
+        For randomize=True, error bars (std dev) are added over multiple iterations.
+        """
         groups = [df for _, df in self.adata.df.groupby('sample_id')]
         if not randomize:
             cum = []
@@ -581,15 +704,14 @@ class _TCRSeqPlotting:
                 union_set.update(d['combined_custom_id'].dropna().unique())
                 cum.append({'sample_num': i, 'unique_clones': len(union_set)})
             df_cum = pd.DataFrame(cum)
-            p = (p9.ggplot(df_cum, p9.aes(x='sample_num', y='unique_clones'))
-                 + p9.geom_bar(stat='identity', fill='cornflowerblue', width=0.7)
-                 + p9.geom_line(group=1, color='blue')
-                 + p9.geom_point(color='blue', size=3)
-                 + p9.labs(title=f"[{self.adata.data_name}] Saturation Curve", 
-                           x='Cumulative Samples', y='Unique Clones')
-                 + professional_theme()
-                 + p9.theme(axis_text_x=p9.element_text(rotation=25, hjust=1))
-                )
+            p = (p9.ggplot(df_cum, p9.aes(x='sample_num', y='unique_clones')) +
+                 p9.geom_col(fill="cornflowerblue") +
+                 p9.geom_line(color="blue", group=1) +
+                 p9.geom_point(color="blue", size=3) +
+                 p9.labs(x="Cumulative Samples", y="Unique Clones",
+                         title=f"[{self.adata.data_name}] Saturation Curve") +
+                 professional_theme() +
+                 p9.theme(panel_spacing=0.4))
             return p
         else:
             n = len(groups)
@@ -606,28 +728,27 @@ class _TCRSeqPlotting:
             arr = np.array(all_cum)
             mean_unique = np.mean(arr, axis=0)
             std_unique = np.std(arr, axis=0)
-            df_plot = pd.DataFrame({'sample_num': np.arange(1, n+1),
-                                    'mean_unique': mean_unique,
-                                    'std_unique': std_unique})
-            p = (p9.ggplot(df_plot, p9.aes(x='sample_num', y='mean_unique'))
-                 + p9.geom_line(color='blue')
-                 + p9.geom_point(color='darkblue', size=3)
-                 + p9.geom_errorbar(
-                        p9.aes(ymin='mean_unique - std_unique',
-                               ymax='mean_unique + std_unique'),
-                        width=0.2)
-                 + p9.labs(title=f"[{self.adata.data_name}] Saturation Curve (Randomized Order)",
-                           x='Cumulative Samples', y='Mean Unique Clones')
-                 + professional_theme()
-                 + p9.theme(axis_text_x=p9.element_text(rotation=25, hjust=1))
-                )
+            df_plot = pd.DataFrame({
+                'sample_num': np.arange(1, n+1),
+                'mean_unique': mean_unique,
+                'std_unique': std_unique
+            })
+            p = (p9.ggplot(df_plot, p9.aes(x='sample_num', y='mean_unique')) +
+                 p9.geom_line(color="blue") +
+                 p9.geom_point(color="blue", size=3) +
+                 p9.geom_errorbar(p9.aes(ymin='mean_unique-std_unique', ymax='mean_unique+std_unique'), width=0.2) +
+                 p9.labs(x="Cumulative Samples", y="Mean Unique Clones",
+                         title=f"[{self.adata.data_name}] Saturation Curve (Randomized Order)") +
+                 professional_theme() +
+                 p9.theme(panel_spacing=0.4))
             return p
 
-    def plot_clonal_expansion(self, bins=None, labels=None, normalize=False):
+    def plot_clonal_expansion(self, bins=None, labels=None, normalize=False, label_order: list = None):
         """
-        Creates a stacked bar plot showing the distribution of clone counts across samples.
-        Default bins represent: 1, 2, 3-5, 6-20, >20 clones. The user may supply custom bins and labels.
-        If normalize is True, proportions per sample are shown.
+        Plots clonal expansion as a stacked bar plot.
+        The x-axis shows samples and the fill indicates expansion bins.
+        When normalize=True, proportions are plotted.
+        label_order is a list specifying the order in which sample IDs should appear on the x-axis.
         """
         if bins is None:
             bins = [0.5, 1.5, 2.5, 5.5, 20.5, np.inf]
@@ -637,7 +758,8 @@ class _TCRSeqPlotting:
             clone_counts = self.adata.df.groupby(['sample_id', 'combined_custom_id'])['consensus_count'].sum().reset_index()
         else:
             clone_counts = self.adata.df.groupby(['sample_id', 'combined_custom_id']).size().reset_index(name='consensus_count')
-        clone_counts['expansion_bin'] = pd.cut(clone_counts['consensus_count'], bins=bins, labels=labels, include_lowest=True)
+        clone_counts['expansion_bin'] = pd.cut(clone_counts['consensus_count'],
+                                                bins=bins, labels=labels, include_lowest=True)
         exp_df = clone_counts.groupby(['sample_id', 'expansion_bin']).size().reset_index(name='n_clones')
         if normalize:
             total = exp_df.groupby('sample_id')['n_clones'].transform('sum')
@@ -647,10 +769,13 @@ class _TCRSeqPlotting:
         else:
             y_val = 'n_clones'
             ylabel = "Number of Clones"
-        p = (p9.ggplot(exp_df, p9.aes(x='sample_id', y=y_val, fill='expansion_bin'))
-             + p9.geom_bar(stat='identity', position='stack')
-             + p9.labs(title=f"[{self.adata.data_name}] Clonal Expansion", x="Sample", y=ylabel, fill="Clone Count")
-             + professional_theme()
-             + p9.theme(axis_text_x=p9.element_text(rotation=90, hjust=1))
-        )
+        p = (p9.ggplot(exp_df, p9.aes(x='sample_id', y=y_val, fill='expansion_bin')) +
+             p9.geom_col() +
+             p9.labs(x="Sample", y=ylabel, fill="Clone Count",
+                     title=f"[{self.adata.data_name}] Clonal Expansion") +
+             professional_theme() +
+             p9.theme(panel_spacing=0.4, axis_text_x=p9.element_text(rotation=45, ha="right")))
+        if label_order is not None:
+            p = p + p9.scale_x_discrete(limits=label_order)
         return p
+
