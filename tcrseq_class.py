@@ -1,4 +1,4 @@
-# Updated : 6 August 2025, 3.45pm
+# Updated : 7 August 2025
 import os
 import re
 import sys
@@ -887,6 +887,7 @@ class _TCRSeqPlotting:
             else:
                 plot += p9.scale_y_log10(labels=lambda l: [f"{v:.1e}" for v in l])
         return plot
+    
     def plot_sample_stats(self, split_by: Optional[str] = None,
                           x_min: Optional[float] = None,
                           y_min: Optional[float] = None,
@@ -1005,75 +1006,6 @@ class _TCRSeqPlotting:
         
         return p1, p2
 
-    def plot_sample_stats_old(
-        self,
-        split_by: Optional[str] = None,
-        x_min: Optional[float] = None,
-        y_min: Optional[float] = None,
-        label_order: Optional[List[str]] = None
-    ) -> Union[p9.ggplot, tuple]:
-        """Per-sample barplots of basic metrics and TRA/TRB clone counts."""
-        stats = self.adata.tl.get_sample_stats()
-        if split_by == 'group':
-            id_vars_ = ['sample_id', 'group']
-        else:
-            id_vars_ = ['sample_id']
-        melt = stats.drop(columns=['n_unique_clones'], errors='ignore').melt(
-            id_vars=id_vars_,
-            var_name='metric', value_name='value'
-        )
-        
-        if split_by and split_by in melt.columns and split_by != 'sample_id':
-            aes1 = p9.aes(x='sample_id', y='value', fill=split_by)
-        else:
-            aes1 = p9.aes(x='sample_id', y='value')
-        
-        p1 = (
-            p9.ggplot(melt, aes1)
-            + p9.geom_col()
-            + p9.facet_wrap('~metric', scales='free_y')
-            + p9.labs(title=f"[{self.adata.project_name}:{self.adata.data_subset}] Per-sample metrics")
-            + economist_theme()
-            + p9.theme(panel_spacing=0.4)
-        )
-        
-        if label_order is not None and len(label_order) > 0:
-            p1 += p9.scale_x_discrete(limits=list(label_order))
-        
-        # Second plot section remains (using fill="chain"):
-        df = self.adata.clonotypes_df
-        tra = (
-            df[df['TRA_custom_id']!='']
-            .drop_duplicates(['sample_id', 'TRA_custom_id'])
-            .groupby('sample_id').size()
-            .reset_index(name='clone_count')
-        )
-        tra['chain'] = 'TRA'
-        trb = (
-            df[df['TRB_custom_id']!='']
-            .drop_duplicates(['sample_id', 'TRB_custom_id'])
-            .groupby('sample_id').size()
-            .reset_index(name='clone_count')
-        )
-        trb['chain'] = 'TRB'
-        counts = pd.concat([tra, trb], ignore_index=True)
-        aes2 = p9.aes(x='sample_id', y='clone_count', fill='chain')
-        p2 = (
-            p9.ggplot(counts, aes2)
-            + p9.geom_col()
-            + p9.labs(title=f"[{self.adata.project_name}:{self.adata.data_subset}] Unique TRA/TRB counts")
-            + economist_theme()
-            + p9.theme(panel_spacing=0.4)
-        )
-        if label_order is not None and len(label_order) > 0:
-            p2 += p9.scale_x_discrete(limits=list(label_order))
-        
-        #if cp:
-        #    import numpy as np
-        #    patch = cp.patch(p1, p2)
-        #    patch += cp.layout(design=np.array([0, 1]).reshape(1,2))
-        #    return patch
-        return p1, p2
 
     def plot_shared_clone(self, split_by: Optional[str] = None, n_top: int = 10) -> p9.ggplot:
         """Bubble-plot of the top N clones shared across samples."""
@@ -1402,210 +1334,8 @@ class _TCRSeqPlotting:
         p += p9.theme(figure_size=(8, dynamic_height))
 
         return p
-    
-    def plot_clone_rank(
-        self,
-        color_by: Optional[str] = None,
-        split_by: Optional[str] = None,
-        normalize: bool = False,
-        sample_subset: Optional[List[str]] = None,
-        log_scale: bool = True
-    ) -> p9.ggplot:
-        """
-        Overlay rank–abundance curves for all samples.
-
-        Each sample's clone count distribution is converted into a rank–abundance curve.
-        Parameters:
-          color_by:     (Optional) A column name from .obs to use for coloring the curves.
-          split_by:     (Optional) A column name from .obs used to facet the plot.
-                        Each unique value gets its own panel (all panels arranged in one row).
-          normalize:    (Optional) If True, each clone's count in a sample is divided by the total number
-                        of unique clones in that sample, so that the y-axis shows a value relative to the 
-                        unique clone count.
-          sample_subset:(Optional) A list of sample IDs to include. If None, all samples (columns in self.adata.X) are used.
-          log_scale:    (Optional) If True, the x-axis is log10-transformed and, when not normalized, the y-axis as well.
-
-        Returns:
-          A plotnine ggplot object with overlaid rank–abundance curves.
-        """
-        import pandas as pd
-        import numpy as np
-
-        # Retrieve the counts matrix (rows = clones, columns = sample IDs)
-        X = self.adata.X.copy()
-
-        # Determine the samples to plot.
-        if sample_subset is not None:
-            valid_samples = [s for s in sample_subset if s in X.columns]
-            if not valid_samples:
-                raise ValueError("No provided sample IDs were found in the counts matrix.")
-            X = X[valid_samples]
-        else:
-            valid_samples = list(X.columns)
-
-        # For each sample, compute its rank–abundance curve.
-        rank_list = []
-        for s in valid_samples:
-            ser = X[s].sort_values(ascending=False)
-            if ser.sum() == 0:
-                continue  # skip samples with zero counts
-            df_sample = pd.DataFrame({
-                "rank": np.arange(1, len(ser) + 1),
-                "count": ser.values,
-                "sample_id": s
-            })
-            if normalize:
-                # Normalize by the total number of unique clones (i.e. the length of the series)
-                total_unique = len(ser)
-                df_sample["value"] = df_sample["count"] / total_unique
-            else:
-                df_sample["value"] = df_sample["count"]
-            rank_list.append(df_sample)
-        if not rank_list:
-            raise ValueError("No data available from the provided samples.")
-        rank_df = pd.concat(rank_list, ignore_index=True)
-
-        # Merge sample-level metadata if either color_by or split_by is provided.
-        if color_by is not None or split_by is not None:
-            obs = self.adata.obs.copy()
-            # Ensure "sample_id" exists as a column.
-            if "sample_id" not in obs.columns:
-                obs = obs.reset_index()
-                if "sample_id" not in obs.columns:
-                    obs = obs.rename(columns={obs.columns[0]: "sample_id"})
-            meta_cols = ["sample_id"]
-            if color_by is not None:
-                meta_cols.append(color_by)
-            if split_by is not None:
-                meta_cols.append(split_by)
-            obs = obs[meta_cols]
-            rank_df = pd.merge(rank_df, obs, on="sample_id", how="left")
-
-        # Define the basic aesthetics.
-        if color_by is not None:
-            mapping = p9.aes(x="rank", y="value", group="sample_id", color=color_by)
-        else:
-            mapping = p9.aes(x="rank", y="value", group="sample_id")
-
-        # Create the base plot.
-        p = (
-            p9.ggplot(rank_df, mapping)
-            + p9.geom_line()
-            + p9.labs(
-                title=f"[{self.adata.project_name}:{self.adata.data_subset}] Overlayed Rank–Abundance Curves",
-                x="Rank",
-                y="Relative Abundance" if normalize else "Clone Count"
-            )
-            + economist_theme()
-        )
-
-        # Apply log-scale transformation if requested.
-        if log_scale:
-            p += p9.scale_x_log10()
-            if not normalize:
-                p += p9.scale_y_log10()
-                p += p9.scale_y_log10(
-                    limits=(1, 10000),  # Set y-axis limits (must be >0 for log scale)
-                    labels=lambda l: [f"{x:.0e}".replace("e+0", "e").replace("e+", "e") for x in l]
-                    #labels=lambda l: [f'{x:.1e}' for x in l]  # Show y-axis labels in scientific notation
-                )
-
-        # Facet the plot if split_by is provided; all panels arranged in one row.
-        if split_by is not None:
-            p += p9.facet_wrap("~" + split_by, nrow=1)           
-            n_splits = obs[split_by].nunique() 
-            base_height = 0.3  # inches per gene (adjust as needed)
-            min_height = 5     # minimum height in inches
-            dynamic_height = max(min_height, n_splits * base_height)
-            p += p9.theme(figure_size=(8, dynamic_height))
-
-        return p
-
 
     
-    def plot_clonal_expansion(
-        self,
-        bins: Optional[List[float]] = None,
-        labels: Optional[List[str]] = None,
-        normalize: bool = False,
-        label_order: Optional[List[str]] = None
-    ) -> p9.ggplot:
-        """
-        Create a stacked barplot of clone-size bins per sample.
-
-        This function bins the clone sizes (using the 'consensus_count' column if available)
-        and then plots, per sample, either the raw clone counts in each bin or the normalized
-        proportions.
-
-        Args:
-            bins: Optional list of bin edges for clone-size (defaults to [0.5, 1.5, 2.5, 5.5, 20.5, np.inf]).
-            labels: Optional labels for each bin (defaults to ["1", "2", "3-5", "6-20", ">20"]).
-            normalize: If True, plot proportions (normalized counts) instead of raw counts.
-            label_order: Optional list specifying the order for the sample_id on the x-axis.
-
-        Returns:
-            A plotnine ggplot object with the clonal expansion stacked barplot.
-        """
-        import numpy as np
-        import pandas as pd
-
-        # Access the clonotypes DataFrame from the TCRSeq object.
-        df = self.adata.clonotypes_df
-
-        # Use default bins and labels if not provided.
-        if bins is None:
-            bins = [0.5, 1.5, 2.5, 5.5, 20.5, np.inf]
-        if labels is None:
-            labels = ["1", "2", "3-5", "6-20", ">20"]
-
-        # Group by sample_id and combined_custom_id.
-        if 'consensus_count' in df.columns:
-            cc = df.groupby(['sample_id', 'combined_custom_id'])['consensus_count'].sum().reset_index()
-        else:
-            cc = df.groupby(['sample_id', 'combined_custom_id']).size().reset_index(name='consensus_count')
-
-        # Bin the consensus_count values into expansion bins.
-        cc['expansion_bin'] = pd.cut(
-            cc['consensus_count'],
-            bins=bins,
-            labels=labels,
-            include_lowest=True
-        )
-
-        # Count clones per sample and expansion_bin.
-        exp_df = cc.groupby(['sample_id', 'expansion_bin']).size().reset_index(name='n_clones')
-
-        # Optionally normalize the counts to proportions.
-        if normalize:
-            total = exp_df.groupby('sample_id')['n_clones'].transform('sum')
-            exp_df['proportion'] = exp_df['n_clones'] / total
-            y_val, ylab = 'proportion', "Proportion of Clones"
-        else:
-            y_val, ylab = 'n_clones', "Number of Clones"
-
-        # Build the ggplot object using plotnine.
-        aes_mapping = p9.aes(x='sample_id', y=y_val, fill='expansion_bin')
-        plot = (
-            p9.ggplot(exp_df, aes_mapping)
-            + p9.geom_col()
-            + p9.labs(
-                x="Sample",
-                y=ylab,
-                fill="Clone Count",
-                title=f"[{self.adata.project_name}:{self.adata.data_subset}] Clonal Expansion"
-            )
-            + economist_theme()
-            + p9.theme(
-                panel_spacing=0.4,
-                axis_text_x=p9.element_text(rotation=45, ha="right")
-            )
-        )
-
-        # Apply a custom x-axis order if provided.
-        if label_order is not None and len(label_order):
-            plot += p9.scale_x_discrete(limits=list(label_order))
-
-        return plot
 
     def plot_cumulative_clone_discovery(self, sample_order: Optional[List[str]] = None) -> plt.Figure:
         """
@@ -1756,120 +1486,151 @@ class _TCRSeqPlotting:
 
         return plot_obj
 
-    def plot_diversity_v1(
+    ##~~
+    def plot_clone_abundance_rank(
         self,
-        label_order: Optional[List[str]] = None,
-        nrow: Optional[int] = None,
-        fill: Optional[str] = None
+        color_by: Optional[str] = None,
+        split_by: Optional[str] = None,
+        normalize: bool = False,
+        sample_subset: Optional[List[str]] = None,
+        log_scale: bool = True,
+        label_order: Optional[List[str]] = None
     ) -> p9.ggplot:
-        """
-        Generate a faceted ggplot that displays diversity metrics for each sample.
-        
-        The plot displays distributions of:
-          - Entropy
-          - Gini
-          - Simpson
-          - Pielou Evenness (computed as Entropy divided by the log of the number
-            of unique clones; defined as 1.0 when only one clone exists)
-        
-        Each measure is shown in its own facet with its own y-axis scale.
-        
-        Args:
-            label_order: Optional list of sample IDs to order the x-axis.
-            nrow: Optional integer for the number of facet rows.
-                  For example, nrow=1 plots all 4 metrics in one row.
-            fill: Optional column name (as a string) from self.adata.obs to map to the fill
-                  aesthetic so that points are colored by a grouping variable.
-        
-        Returns:
-            A plotnine ggplot object.
-        """
         import numpy as np
         import pandas as pd
-
-        # Retrieve the diversity measures (each expected to be a pd.Series indexed by sample_id)
-        entropy_series = self.adata.entropy
-        gini_series    = self.adata.gini
-        simpson_series = self.adata.simpson
-
-        # Ensure that the series' index names are set to "sample_id"
-        if entropy_series.index.name is None:
-            entropy_series.index.name = "sample_id"
-        if gini_series.index.name is None:
-            gini_series.index.name = "sample_id"
-        if simpson_series.index.name is None:
-            simpson_series.index.name = "sample_id"
-
-        # Create DataFrames (long-format) for each measure.
-        entropy_df = entropy_series.reset_index(name="value")
-        entropy_df["measure"] = "Entropy"
-
-        gini_df = gini_series.reset_index(name="value")
-        gini_df["measure"] = "Gini"
-
-        simpson_df = simpson_series.reset_index(name="value")
-        simpson_df["measure"] = "Simpson"
-
-        # Compute Pielou Evenness: for each sample, it equals Entropy / log(n_unique_clones),
-        # or 1 if only one clone exists.
-        n_unique = self.adata.clonotypes_df.groupby("sample_id")["combined_custom_id"].nunique()
-        pielou_series = entropy_series.copy()
-        condition = n_unique > 1
-        pielou_series.loc[condition] = pielou_series.loc[condition] / np.log(n_unique[condition])
-        pielou_series.loc[~condition] = 1.0
-
-        if pielou_series.index.name is None:
-            pielou_series.index.name = "sample_id"
-        pielou_df = pielou_series.reset_index(name="value")
-        pielou_df["measure"] = "Pielou Evenness"
-
-        # Combine all metrics into one long-format DataFrame.
-        diversity_df = pd.concat([entropy_df, gini_df, simpson_df, pielou_df], ignore_index=True)
-
-        # If a fill mapping is requested, merge in the corresponding column from .obs.
-        # Assumes that self.adata.obs has sample_id as its index.
-        if fill is not None:
-            obs_df = self.adata.obs.reset_index()[["sample_id", fill]]
-            diversity_df = pd.merge(diversity_df, obs_df, on="sample_id", how="left")
-            mapping = p9.aes(x="sample_id", y="value", fill=fill)
+        
+        X = self.adata.X.copy()
+        if sample_subset is not None:
+            valid_samples = [s for s in sample_subset if s in X.columns]
+            if not valid_samples:
+                raise ValueError("No provided sample IDs were found in the counts matrix.")
+            X = X[valid_samples]
         else:
-            mapping = p9.aes(x="sample_id", y="value")
+            valid_samples = list(X.columns)
+        
+        rank_list = []
+        for s in valid_samples:
+            ser = X[s].sort_values(ascending=False)
+            if ser.sum() == 0:
+                continue
+            
+            df_sample = pd.DataFrame({
+                "rank": np.arange(1, len(ser) + 1),
+                "count": ser.values,
+                "sample_id": s
+            })
+            if normalize:
+                total_count = ser.sum()
+                df_sample["value"] = df_sample["count"] / total_count
+            else:
+                df_sample["value"] = df_sample["count"]
+            rank_list.append(df_sample)
+        
+        if not rank_list:
+            raise ValueError("No data available from the provided samples.")
+        
+        rank_df = pd.concat(rank_list, ignore_index=True)
 
-        # Define the facet layout.
-        if nrow is not None:
-            facet = p9.facet_wrap("~ measure", scales="free_y", nrow=nrow)
+        if color_by is not None or split_by is not None:
+            obs = self.adata.obs.copy()
+            if "sample_id" not in obs.columns:
+                obs = obs.reset_index()
+                if "sample_id" not in obs.columns:
+                    obs = obs.rename(columns={obs.columns[0]: "sample_id"})
+            
+            meta_cols = ["sample_id"]
+            if color_by is not None:
+                meta_cols.append(color_by)
+            if split_by is not None:
+                meta_cols.append(split_by)
+            
+            obs = obs[meta_cols]
+            rank_df = pd.merge(rank_df, obs, on="sample_id", how="left")
+            
+            if color_by is not None:
+                rank_df[color_by] = rank_df[color_by].astype(str)
+        
+        if color_by is not None:
+            rank_df["_color_str"] = rank_df[color_by].apply(
+                lambda x: str(x) if not pd.isnull(x) else "None"
+            )
+            
+            rank_df = rank_df.drop(columns=[color_by], errors="ignore")
+            rank_df = rank_df.drop(columns=["color"], errors="ignore")
+            
+            color_limits = sorted(rank_df['_color_str'].dropna().unique())
+        
+        if color_by is not None:
+            mapping = p9.aes(x="rank", y="value", group="sample_id", color="_color_str")
         else:
-            facet = p9.facet_wrap("~ measure", scales="free_y")
-
-        # Build the ggplot object.
-        plot_obj = (
-            p9.ggplot(diversity_df, mapping)
-            + p9.geom_point(size=5)
-            + p9.geom_line(p9.aes(group=1))  # Connect the points – group=1 ensures a single line per facet.
-            + facet
+            mapping = p9.aes(x="rank", y="value", group="sample_id")
+        
+        p = (
+            p9.ggplot(rank_df, mapping)
+            + p9.geom_line(alpha=0.8)
             + p9.labs(
-                title=f"[{self.adata.project_name}:{self.adata.data_subset}] Diversity Metrics",
-                x="Sample",
-                y="Diversity Value"
+                title="Overlayed Rank–Abundance Curves",
+                x="Rank",
+                y="Relative Abundance" if normalize else "Clone Count"
             )
             + economist_theme()
-            + p9.theme(
-                  axis_text_x=p9.element_text(rotation=45, ha="right"),
-                  panel_spacing=0.8  # Increase distance between subplots.
-              )
         )
+        
+        if log_scale:
+            p += p9.scale_x_log10()
+            if not normalize:
+                p += p9.scale_y_log10(
+                    limits=(1, 10000),
+                    labels=lambda l: [f"{x:.0e}".replace("e+0", "e").replace("e+", "e") for x in l]
+                )
+        
+        if color_by is not None:
+            from matplotlib import cm, colors
+            
+            # Determine the final limits for the legend and color mapping
+            if label_order is not None and all(str(item) in color_limits for item in label_order):
+                final_limits = [str(label) for label in label_order]
+            else:
+                final_limits = sorted(rank_df['_color_str'].dropna().unique())
+            
+            tab10_colors = [colors.rgb2hex(cm.tab10(i)) for i in range(10)]
+            tab20_colors = [colors.rgb2hex(cm.tab20(i)) for i in range(20)]
+            default_colors = tab10_colors + tab20_colors
+            
+            palette = {label: default_colors[i % len(default_colors)] for i, label in enumerate(final_limits)}
+            
+            p += p9.scale_color_manual(values=palette, limits=final_limits, name=color_by)
 
-        # Adjust the overall figure size based on the layout.
-        if nrow == 1:
-            plot_obj = plot_obj + p9.theme(figure_size=(16, 3))
+        if split_by is not None:
+            p += p9.facet_wrap("~" + split_by, nrow=1)
+            n_splits = rank_df[split_by].nunique()
+            base_height = 0.3
+            min_height = 5
+            dynamic_height = max(min_height, n_splits * base_height)
+            p += p9.theme(figure_size=(8, dynamic_height))
+        
+        x_min_val = rank_df["rank"].min()
+        y_max_val = rank_df["value"].max()
+        
+        if log_scale:
+            project_annot_x = 10**np.log10(x_min_val) if x_min_val > 0 else 1e-10
+            project_annot_y = 10**np.log10(y_max_val) if y_max_val > 0 else 1e-10
         else:
-            plot_obj = plot_obj + p9.theme(figure_size=(8, 6))
-
-        if label_order is not None and len(label_order) > 0:
-            plot_obj += p9.scale_x_discrete(limits=label_order)
-
-        return plot_obj
-    
-
-    
+            project_annot_x = x_min_val
+            project_annot_y = y_max_val
+        
+        project_label = f"[{self.adata.project_name}::{self.adata.data_subset}]"
+        p += p9.annotate(
+            "text",
+            x=project_annot_x,
+            y=project_annot_y,
+            label=project_label,
+            size=8,
+            ha="left",
+            va="top",
+            color="gray"
+        )
+        
+        return p    
+##===
 __all__ = ["TCRSeq", "economist_theme", "unit", "SampleStats"]
